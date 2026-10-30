@@ -1,0 +1,78 @@
+name: fetch-nodes
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: download sources
+        run: |
+          mkdir -p out
+          urls=(
+            "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"
+            "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
+            "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt"
+            "https://raw.githubusercontent.com/ripaojiedian/freenode/main/sub"
+            "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt"
+            "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt"
+          )
+          i=0
+          for u in "${urls[@]}"; do
+            i=$((i+1))
+            curl -sL --max-time 60 "$u" | base64 -d 2>/dev/null >> out/raw.txt || true
+            curl -sL --max-time 60 "$u" >> out/raw.txt || true
+          done
+          grep -Eo '(vless|vmess|trojan|ss|hysteria2)://[^"[:space:]]+' out/raw.txt | sort -u > out/nodes.txt
+          wc -l out/nodes.txt
+      - name: test alive
+        run: |
+          curl -sL -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q xray.zip xray geoip.dat geosite.dat
+          chmod +x xray
+          head -n 400 out/nodes.txt > out/cand.txt
+          ./xray run -c <(echo '{"log":{"loglevel":"none"},"inbounds":[{"port":1080,"listen":"127.0.0.1","protocol":"socks","settings":{"udp":true}}],"outbounds":[]}') &
+          sleep 2 || true
+          : > out/alive.txt
+          while read -r n; do
+            echo "$n" > out/one.txt
+            timeout 6 ./xray run -c <(python3 - "$n" <<'EOF'
+          import json,sys,base64,urllib.parse as up
+          l=sys.argv[1]
+          o={}
+          if l.startswith("vless://"):
+              p=up.urlparse(l); q=dict(up.parse_qsl(p.query))
+              o={"protocol":"vless","settings":{"vnext":[{"address":p.hostname,"port":int(p.port),"users":[{"id":p.username,"encryption":"none","flow":q.get("flow","")}]}]},"streamSettings":{"network":q.get("type","tcp"),"security":q.get("security","none")}}
+          elif l.startswith("trojan://"):
+              p=up.urlparse(l)
+              o={"protocol":"trojan","settings":{"servers":[{"address":p.hostname,"port":int(p.port),"password":p.username}]},
+                 "streamSettings":{"security":"tls","tlsSettings":{"serverName":p.hostname}}}
+          elif l.startswith("ss://"):
+              b=l[5:].split("#")[0]
+              try: b=base64.b64decode(b+"==").decode()
+              except: pass
+              m,_,h=b.partition("@"); hh,_,pp=h.partition(":")
+              mm=base64.b64decode(m+"==").decode()
+              o={"protocol":"shadowsocks","settings":{"servers":[{"address":hh,"port":int(pp),"method":mm.split(":")[0],"password":mm.split(":")[1]}]}}
+          print(json.dumps({"log":{"loglevel":"none"},"inbounds":[{"port":2080,"listen":"127.0.0.1","protocol":"socks","settings":{}}],
+            "outbounds":[dict(o,tag="p")],"routing":{"rules":[{"type":"field","outboundTag":"p","network":"tcp,udp"}]}}))
+          EOF
+          ) > /dev/null 2>&1 &
+            sleep 4
+            if curl -s --socks5-hostname 127.0.0.1:2080 --max-time 8 -o /dev/null -w '%{http_code}' https://www.gstatic.com/generate_204 | grep -q 204; then
+              echo "$n" >> out/alive.txt
+            fi
+            pkill -f "xray run" 2>/dev/null || true
+            sleep 1
+          done < out/cand.txt
+          wc -l out/alive.txt
+      - name: commit
+        run: |
+          base64 -w0 out/alive.txt > sub.txt
+          git config user.name bot
+          git config user.email bot@users.noreply.github.com
+          git add sub.txt
+          git commit -m "update" || true
+          git push
